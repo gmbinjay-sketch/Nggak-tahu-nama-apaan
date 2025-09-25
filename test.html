@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MiniWA - Telepon Real (Firebase Signaling) — FINAL</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial; background:#f3f3f3;margin:0;padding:18px;color:#222}
+  .card{background:#fff;padding:14px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.06);max-width:920px;margin:10px auto;}
+  label{display:block;margin:8px 0 6px;font-weight:600}
+  input{padding:10px;border-radius:8px;border:1px solid #ddd;width:100%}
+  button{padding:10px 14px;border-radius:8px;border:none;background:#075E54;color:#fff;cursor:pointer}
+  .muted{color:#666;font-size:13px}
+  #popupCall, #incomingModal{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#fff;padding:16px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.25);display:none;z-index:999}
+  #popupCall button, #incomingModal button{margin:6px}
+  .danger{background:#f44336}
+  .success{background:#25D366;color:#000}
+  .row{display:flex;gap:8px}
+  .col{flex:1}
+  small{display:block;margin-top:8px}
+  #log{height:160px;overflow:auto;background:#111;color:#bfbfbf;padding:10px;border-radius:8px;font-family:monospace;font-size:13px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>MiniWA - Telepon (Firebase Signaling) — FINAL</h2>
+    <label>Username (ID) — isi unik per device</label>
+    <input id="myId" placeholder="Contoh: A" />
+    <label>Nomor tujuan (ID)</label>
+    <input id="targetId" placeholder="Contoh: B" />
+    <div style="margin-top:10px" class="row">
+      <button id="loginBtn">Login / Set ID</button>
+      <button id="callBtn">☎️ Telepon</button>
+      <button id="hangupBtn" class="danger" style="display:none">Akhiri Panggilan</button>
+    </div>
+    <small class="muted">Test: buka file ini di dua device / tab, set username berbeda lalu telepon. Gunakan HTTPS atau localhost.</small>
+    <div style="margin-top:12px">
+      <div id="status" class="muted">Status: belum login</div>
+      <div id="callInfo" style="margin-top:8px;font-weight:600"></div>
+    </div>
+    <h3 style="margin-top:12px">Log</h3>
+    <div id="log"></div>
+  </div>
+
+  <!-- Incoming modal -->
+  <div id="incomingModal">
+    <div id="incomingText" style="font-weight:700;margin-bottom:12px"></div>
+    <div style="text-align:center">
+      <button id="acceptBtn" class="success">Terima</button>
+      <button id="rejectBtn" class="danger">Tolak</button>
+    </div>
+  </div>
+
+  <!-- Waiting / In-call popup -->
+  <div id="popupCall">
+    <div id="popupText" style="font-weight:700;margin-bottom:12px"></div>
+    <div style="text-align:center">
+      <button id="popupEndBtn" class="danger">Akhiri Panggilan</button>
+    </div>
+  </div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-app.js";
+import { getDatabase, ref, set, push, onValue, remove, get } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-database.js";
+
+/* ==================== CONFIG ==================== 
+   Ganti firebaseConfig jika mau pakai project sendiri.
+*/
+const firebaseConfig = {
+  apiKey: "AIzaSyD6ByBc-rwHki_JqGlI0KRv6UEX1_buPTA",
+  authDomain: "tic-tac-toe-1587c.firebaseapp.com",
+  databaseURL: "https://tic-tac-toe-1587c-default-rtdb.firebaseio.com",
+  projectId: "tic-tac-toe-1587c",
+  storageBucket: "tic-tac-toe-1587c.appspot.com",
+  messagingSenderId: "113995791393",
+  appId: "1:113995791393:web:25e7424230bd4ffc0bb760",
+  measurementId: "G-WTF3RYCW6Y"
+};
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+/* ================================================= */
+
+const myIdInput = document.getElementById('myId');
+const targetIdInput = document.getElementById('targetId');
+const loginBtn = document.getElementById('loginBtn');
+const callBtn = document.getElementById('callBtn');
+const hangupBtn = document.getElementById('hangupBtn');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const callInfo = document.getElementById('callInfo');
+
+const incomingModal = document.getElementById('incomingModal');
+const incomingText = document.getElementById('incomingText');
+const acceptBtn = document.getElementById('acceptBtn');
+const rejectBtn = document.getElementById('rejectBtn');
+
+const popupCall = document.getElementById('popupCall');
+const popupText = document.getElementById('popupText');
+const popupEndBtn = document.getElementById('popupEndBtn');
+
+let username = null;
+let currentTarget = null;
+let pc = null;
+let localStream = null;
+let remoteAudioEl = null;
+
+let remoteDescSet = false;
+let offerInProgress = false;
+let incomingProcessing = false;
+let pendingCandidates = [];
+
+// unsubscribe handles
+let unsubCalls = null;
+let unsubIce = null;
+let unsubEndCall = null;
+let unsubAnswers = null;
+
+const ICE_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+function log(msg){ const row = document.createElement('div'); row.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`; logEl.prepend(row); }
+function showStatus(t){ statusEl.textContent = 'Status: ' + t; }
+function showCallPopup(text){ popupText.textContent = text; popupCall.style.display = 'block'; }
+function hideCallPopup(){ popupCall.style.display = 'none'; }
+function showIncoming(from){ incomingText.textContent = `Panggilan masuk dari ${from}`; incomingModal.style.display = 'block'; }
+function hideIncoming(){ incomingModal.style.display = 'none'; incomingProcessing = false; }
+function setCallInfo(txt){ callInfo.textContent = txt; }
+
+/* ====== REALTIME LISTENERS (calls/{username}, ice/{username}, endCall/{username}) ====== */
+function startRealtimeListeners(){
+  if (!username) return;
+
+  // incoming offers
+  const callsRef = ref(db, `calls/${username}`);
+  if (unsubCalls) unsubCalls();
+  unsubCalls = onValue(callsRef, (snap) => {
+    const data = snap.val();
+    if (!data) return;
+    if (data.offer && data.from && data.status === 'ringing') {
+      if (incomingProcessing || (pc && remoteDescSet)) {
+        log('Ada panggilan namun sedang sibuk; mengabaikan sementara.');
+        return;
+      }
+      incomingProcessing = true;
+      currentTarget = data.from;
+      log(`Diterima offer dari ${data.from}`);
+      showIncoming(data.from);
+    }
+  }, (err) => {
+    console.error('calls onValue err', err);
+  });
+
+  // ICE candidates targeted to me
+  const iceRef = ref(db, `ice/${username}`);
+  if (unsubIce) unsubIce();
+  unsubIce = onValue(iceRef, (snap) => {
+    if (!snap.exists()) return;
+    snap.forEach(child => {
+      const val = child.val();
+      if (!val || !val.candidate) {
+        remove(child.ref).catch(()=>{});
+        return;
+      }
+      if (pc && remoteDescSet) {
+        pc.addIceCandidate(val.candidate).then(()=> {
+          log('addIceCandidate immediate');
+          remove(child.ref).catch(()=>{});
+        }).catch(e => console.error('addIceCandidate err:', e));
+      } else {
+        // store candidate and ref to remove later
+        pendingCandidates.push({ candidate: val.candidate, ref: child.ref });
+        log('Simpan ICE candidate sementara');
+      }
+    });
+  }, (err) => { console.error('ice onValue err', err); });
+
+  // endCall notices
+  const endRef = ref(db, `endCall/${username}`);
+  if (unsubEndCall) unsubEndCall();
+  unsubEndCall = onValue(endRef, (snap) => {
+    const v = snap.val();
+    if (v && v.from) {
+      log(`endCall diterima dari ${v.from}`);
+      // don't notify remote again when handling endCall here
+      endCall(false);
+      remove(endRef).catch(()=>{});
+    }
+  }, (err)=>{ console.error('endCall onValue err', err); });
+}
+
+/* ====== LOGIN / RESTORE ====== */
+loginBtn.onclick = () => {
+  const v = myIdInput.value.trim();
+  if (!v) { alert('Isi ID kamu'); return; }
+  username = v;
+  localStorage.setItem('miniwa_id', username);
+  showStatus(`logged in sebagai ${username}`);
+  log(`Logged in sebagai ${username}`);
+  startRealtimeListeners();
+};
+const restore = localStorage.getItem('miniwa_id');
+if (restore){ myIdInput.value = restore; username = restore; showStatus(`logged in sebagai ${username}`); startRealtimeListeners(); }
+
+/* ====== START CALL (caller) ====== */
+callBtn.onclick = async () => {
+  if (!username) { alert('Login dulu'); return; }
+  const target = targetIdInput.value.trim();
+  if (!target) { alert('Isi target ID'); return; }
+  currentTarget = target;
+  offerInProgress = true;
+  remoteDescSet = false;
+  pendingCandidates = [];
+  showCallPopup(`Menelpon ${target}...`);
+  setCallInfo(`Menelpon ${target}...`);
+  hangupBtn.style.display = 'inline-block';
+  log(`Mulai panggilan ke ${target}`);
+
+  try {
+    await ensureLocalStream();
+    pc = new RTCPeerConnection(ICE_CONFIG);
+    setupPCHandlers(pc, username, currentTarget);
+
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log('Offer dibuat & setLocalDescription');
+
+    await set(ref(db, `calls/${target}`), { from: username, offer: offer, status: 'ringing', ts: Date.now() });
+    log('Offer dikirim ke DB');
+
+    // listen for answer once via answers/{username}
+    const answerRef = ref(db, `answers/${username}`);
+    if (unsubAnswers) unsubAnswers();
+    unsubAnswers = onValue(answerRef, async (snap) => {
+      const d = snap.val();
+      if (!d) return;
+      if (d.rejected) {
+        log(`${d.from} menolak panggilan`);
+        hideCallPopup(); setCallInfo(''); remove(answerRef).catch(()=>{});
+        return;
+      }
+      if (d.answer && !remoteDescSet) {
+        try {
+          log('Menerima answer — setRemoteDescription');
+          await pc.setRemoteDescription(d.answer);
+          remoteDescSet = true;
+          log('Remote description berhasil diset (caller)');
+          // replay pending ICE
+          for (const item of pendingCandidates) {
+            try {
+              await pc.addIceCandidate(item.candidate);
+              if (item.ref) remove(item.ref).catch(()=>{});
+              log('Replayed pending ICE (caller)');
+            } catch(e){ console.error('replay ICE err:', e); }
+          }
+          pendingCandidates = [];
+          // cleanup
+          remove(answerRef).catch(()=>{});
+          remove(ref(db, `calls/${target}`)).catch(()=>{});
+          hideCallPopup();
+          setCallInfo(`Sedang menelpon dengan ${target}`);
+          log('Panggilan terhubung (caller).');
+        } catch (err) {
+          console.error('setRemoteDescription error (caller):', err);
+          log('Error saat setRemoteDescription di caller: ' + (err.message||err));
+          endCall(true);
+        }
+      }
+    }, (err)=>{ console.error('answers onValue err', err); });
+  } catch (err) {
+    console.error('Gagal memulai panggilan:', err);
+    log('Gagal memulai panggilan: ' + (err.message||err));
+    hideCallPopup();
+    hangupBtn.style.display = 'none';
+    setCallInfo('');
+    offerInProgress = false;
+  }
+};
+
+/* ====== ACCEPT (callee) - use get() for one-time read to avoid unsub race ====== */
+acceptBtn.onclick = async () => {
+  if (!username) return;
+  hideIncoming();
+  showCallPopup(`Menyambungkan...`);
+  setCallInfo(`Menyambungkan...`);
+  try {
+    const callsRef = ref(db, `calls/${username}`);
+    const snap = await get(callsRef); // one-time read
+    const offerData = snap.exists() ? snap.val() : null;
+    if (!offerData || !offerData.offer || !offerData.from) {
+      log('Offer tidak ditemukan (sudah dihapus?)');
+      hideCallPopup(); setCallInfo(''); incomingProcessing = false;
+      return;
+    }
+    currentTarget = offerData.from;
+    await ensureLocalStream();
+    pc = new RTCPeerConnection(ICE_CONFIG);
+    setupPCHandlers(pc, username, currentTarget);
+
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+    // set remote (offer) then create answer
+    await pc.setRemoteDescription(offerData.offer);
+    remoteDescSet = true;
+    log('Offer diset sebagai remoteDescription (callee)');
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    log('Answer dibuat & setLocalDescription (callee)');
+
+    await set(ref(db, `answers/${offerData.from}`), { from: username, answer: answer, ts: Date.now() });
+    log('Answer dikirim ke caller');
+
+    // replay pending ICE
+    for (const item of pendingCandidates) {
+      try {
+        await pc.addIceCandidate(item.candidate);
+        if (item.ref) remove(item.ref).catch(()=>{});
+        log('Replayed pending ICE (callee)');
+      } catch(e){ console.error('replay ICE callee err', e); }
+    }
+    pendingCandidates = [];
+
+    // cleanup offer (callee path)
+    remove(ref(db, `calls/${username}`)).catch(()=>{});
+    hideCallPopup();
+    showCallPopup(`Sedang menelpon dengan ${currentTarget}`);
+    setCallInfo(`Sedang menelpon dengan ${currentTarget}`);
+    hangupBtn.style.display = 'inline-block';
+    log('Panggilan terhubung (callee).');
+  } catch (err) {
+    console.error('Gagal menerima panggilan:', err);
+    log('Gagal menerima panggilan: ' + (err.message||err));
+    hideCallPopup();
+    setCallInfo('');
+    incomingProcessing = false;
+  }
+};
+
+/* ====== REJECT ====== */
+rejectBtn.onclick = async () => {
+  if (!username) { hideIncoming(); incomingProcessing=false; return; }
+  try {
+    if (currentTarget) {
+      await set(ref(db, `answers/${currentTarget}`), { from: username, rejected: true, ts: Date.now() });
+      log('Kirim reject ke caller');
+    }
+    await remove(ref(db, `calls/${username}`)).catch(()=>{});
+  } catch(e){ console.error(e); }
+  hideIncoming(); incomingProcessing = false;
+  setCallInfo('');
+};
+
+/* ====== HANGUP ====== */
+popupEndBtn.onclick = endCall;
+hangupBtn.onclick = endCall;
+
+async function endCall(notify=true){
+  try {
+    if (notify && currentTarget) {
+      await set(ref(db, `endCall/${currentTarget}`), { from: username, ts: Date.now() });
+      await set(ref(db, `endCall/${username}`), { from: username, ts: Date.now() });
+    }
+  } catch(e){ console.error(e); }
+
+  if (pc) try { pc.close(); } catch(_){} pc = null;
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  remoteDescSet = false;
+  offerInProgress = false;
+  incomingProcessing = false;
+  pendingCandidates = [];
+
+  hideIncoming(); hideCallPopup();
+  hangupBtn.style.display = 'none';
+  setCallInfo('');
+  log('Panggilan diakhiri, membersihkan DB...');
+
+  // DB cleanup
+  if (username) {
+    remove(ref(db, `calls/${username}`)).catch(()=>{});
+    remove(ref(db, `answers/${username}`)).catch(()=>{});
+    remove(ref(db, `ice/${username}`)).catch(()=>{});
+    remove(ref(db, `endCall/${username}`)).catch(()=>{});
+  }
+  if (currentTarget) {
+    remove(ref(db, `calls/${currentTarget}`)).catch(()=>{});
+    remove(ref(db, `answers/${currentTarget}`)).catch(()=>{});
+    remove(ref(db, `ice/${currentTarget}`)).catch(()=>{});
+    remove(ref(db, `endCall/${currentTarget}`)).catch(()=>{});
+  }
+
+  // unsubscribe listeners
+  if (unsubCalls) { try { unsubCalls(); } catch(_){} unsubCalls = null; }
+  if (unsubIce) { try { unsubIce(); } catch(_){} unsubIce = null; }
+  if (unsubEndCall) { try { unsubEndCall(); } catch(_){} unsubEndCall = null; }
+  if (unsubAnswers) { try { unsubAnswers(); } catch(_){} unsubAnswers = null; }
+
+  currentTarget = null;
+}
+
+/* ====== local stream ====== */
+async function ensureLocalStream(){
+  if (localStream) return;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    if (!remoteAudioEl) {
+      remoteAudioEl = document.createElement('audio');
+      remoteAudioEl.autoplay = true;
+      remoteAudioEl.style.display = 'none';
+      document.body.appendChild(remoteAudioEl);
+    }
+    log('Akses mikrofon OK');
+  } catch (err) {
+    log('Gagal akses mikrofon: ' + (err.message||err));
+    throw err;
+  }
+}
+
+/* ====== PC handler (ICE push) ====== */
+function setupPCHandlers(pcInstance, localId, remoteId) {
+  pcInstance.onicecandidate = (evt) => {
+    if (!evt.candidate) return;
+    push(ref(db, `ice/${remoteId}`), { from: localId, candidate: evt.candidate.toJSON(), ts: Date.now() })
+      .then(()=> log('Kirim ICE candidate ke ' + remoteId))
+      .catch(e => console.error('Gagal push ICE:', e));
+  };
+  pcInstance.ontrack = (ev) => {
+    const stream = ev.streams && ev.streams[0];
+    if (stream && remoteAudioEl) {
+      remoteAudioEl.srcObject = stream;
+      remoteAudioEl.play().catch(()=>{});
+      log('Menerima audio remote');
+    }
+  };
+}
+
+/* ====== on unload cleanup ====== */
+window.addEventListener('beforeunload', async () => {
+  if (username) {
+    try {
+      await remove(ref(db, `calls/${username}`));
+      await remove(ref(db, `answers/${username}`));
+      await remove(ref(db, `ice/${username}`));
+      await remove(ref(db, `endCall/${username}`));
+    } catch(_) {}
+  }
+});
+
+log('App siap. Login untuk mulai.');
+</script>
+</body>
+</html>
